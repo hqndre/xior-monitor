@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Xior Groningen studio availability monitor.
+Xior Groningen studio availability monitor (Scrape.do edition).
 
-Loads the Xior booking site in a headless browser, scans for studios
-in Groningen, and emails when new ones appear. Designed to run every
-5 minutes on GitHub Actions.
+Fetches the booking site through Scrape.do's residential proxy +
+JS-rendering API, which bypasses Cloudflare. Designed to run hourly
+on GitHub Actions to stay within the 1000 free calls/month budget.
 
-State is kept in state.json (committed back to the repo by the workflow)
-so we only email on *changes*, not every run.
+State is kept in state.json (committed back by the workflow) so we
+only email on *changes*, not every run.
 """
 
 from __future__ import annotations
@@ -15,89 +15,52 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import smtplib
 import sys
-import time
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-
-try:
-    from playwright_stealth import stealth_sync
-    HAVE_STEALTH = True
-except ImportError:
-    HAVE_STEALTH = False
 
 # ----- config -----
 BOOKING_URL = "https://www.xior-booking.com/"
 CITY = "Groningen"
 STATE_FILE = Path(__file__).parent / "state.json"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+SCRAPE_DO_API = "https://api.scrape.do/"
 
 
 def render_booking_page() -> str:
-    """Open the booking site in headless Chromium, return rendered HTML.
+    """Fetch the booking site via Scrape.do (Cloudflare bypass + JS render)."""
+    token = os.environ["SCRAPE_DO_TOKEN"]
 
-    Uses playwright-stealth to evade basic Cloudflare bot detection,
-    and waits patiently for any 'Just a moment...' challenge to resolve.
-    """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
+    params = {
+        "token": token,
+        "url": BOOKING_URL,
+        "render": "true",       # full JavaScript rendering
+        "super": "true",        # premium residential proxies (Cloudflare bypass)
+        "geoCode": "nl",        # come from a Netherlands IP
+    }
+
+    print(f"requesting {BOOKING_URL} via Scrape.do ...")
+    try:
+        resp = requests.get(SCRAPE_DO_API, params=params, timeout=120)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Scrape.do request failed: {e}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Scrape.do returned HTTP {resp.status_code}: {resp.text[:300]}"
         )
-        ctx = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
-            timezone_id="Europe/Amsterdam",
+
+    html = resp.text
+
+    # Sanity check — if Cloudflare still showing, something is wrong on their end.
+    if "Just a moment" in html or "challenge-platform" in html:
+        raise RuntimeError(
+            "Cloudflare challenge still present in Scrape.do response. "
+            "Try increasing wait time or contact Scrape.do support."
         )
-        page = ctx.new_page()
-        if HAVE_STEALTH:
-            stealth_sync(page)
-        else:
-            print("warn: playwright-stealth not installed; running without it")
-
-        page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=60_000)
-
-        # Wait up to 45s for Cloudflare's "Just a moment..." challenge to clear.
-        deadline = time.time() + 45
-        cleared = False
-        while time.time() < deadline:
-            content = page.content()
-            if "Just a moment" not in content and "challenge-platform" not in content:
-                cleared = True
-                break
-            page.wait_for_timeout(1500)
-
-        if not cleared:
-            raise RuntimeError(
-                "Bot-protection challenge did not clear within 45 seconds. "
-                "Xior may have tightened protection."
-            )
-
-        # Let any post-challenge JS render the listings
-        page.wait_for_timeout(5_000)
-
-        # Force-load lazy lists by scrolling
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2_000)
-        except Exception:
-            pass
-
-        html = page.content()
-        browser.close()
 
     return html
 
@@ -188,7 +151,6 @@ def send_email(subject: str, body: str) -> None:
 
 
 def main() -> int:
-    print("fetching xior-booking.com ...")
     html = render_booking_page()
     studios = extract_groningen_studios(html)
     print(f"found {len(studios)} Groningen listing(s)")
