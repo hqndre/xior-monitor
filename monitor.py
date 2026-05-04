@@ -17,6 +17,7 @@ import json
 import os
 import smtplib
 import sys
+import time
 from email.mime.text import MIMEText
 from pathlib import Path
 
@@ -30,8 +31,14 @@ STATE_FILE = Path(__file__).parent / "state.json"
 SCRAPE_DO_API = "https://api.scrape.do/"
 
 
-def render_booking_page() -> str:
-    """Fetch the booking site via Scrape.do (Cloudflare bypass + JS render)."""
+def render_booking_page() -> str | None:
+    """Fetch the booking site via Scrape.do (Cloudflare bypass + JS render).
+
+    Returns the HTML on success, or None if Scrape.do had a transient
+    'cannot handle browser network' (HTTP 502) issue that didn't consume
+    credits. The caller should treat None as 'skip this run, try next time'
+    rather than failing loudly.
+    """
     token = os.environ["SCRAPE_DO_TOKEN"]
 
     params = {
@@ -40,35 +47,65 @@ def render_booking_page() -> str:
         "render": "true",       # JS rendering — Scrape.do handles anti-bot automatically with this alone
     }
 
-    print(f"requesting {BOOKING_URL} via Scrape.do ...")
-    try:
-        resp = requests.get(SCRAPE_DO_API, params=params, timeout=120)
-    except requests.RequestException as e:
-        raise RuntimeError(f"Scrape.do request failed: {e}") from e
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        print(f"requesting {BOOKING_URL} via Scrape.do (attempt {attempt}/{max_attempts}) ...")
+        try:
+            resp = requests.get(SCRAPE_DO_API, params=params, timeout=120)
+        except requests.RequestException as e:
+            print(f"network error: {e}")
+            if attempt < max_attempts:
+                time.sleep(30)
+                continue
+            raise RuntimeError(
+                f"Scrape.do request failed after {max_attempts} attempts: {e}"
+            ) from e
 
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Scrape.do returned HTTP {resp.status_code}: {resp.text[:300]}"
+        # Success path
+        if resp.status_code == 200:
+            html = resp.text
+            print(f"got {len(html):,} bytes of HTML")
+
+            # Sanity check — only flag as challenge page if <title> is clearly Cloudflare
+            soup_head = BeautifulSoup(html, "html.parser")
+            title = (soup_head.title.string or "").strip() if soup_head.title else ""
+            print(f"page title: {title!r}")
+
+            if "Just a moment" in title or "Attention Required" in title:
+                raise RuntimeError(
+                    f"Cloudflare challenge page detected (title: {title!r}). "
+                    "Scrape.do failed to clear it."
+                )
+            return html
+
+        # Non-200 response
+        body = resp.text[:500]
+        print(f"Scrape.do returned HTTP {resp.status_code}: {body}")
+
+        # ErrorCode 90 = "cannot handle browser network" — transient, not charged
+        is_transient = (
+            resp.status_code == 502
+            and ('"ErrorCode":90' in body or "cannot handle browser network" in body)
         )
 
-    html = resp.text
-    print(f"got {len(html):,} bytes of HTML")
+        if is_transient and attempt < max_attempts:
+            print(f"transient 502, waiting 30s before retry...")
+            time.sleep(30)
+            continue
 
-    # Sanity check — only flag as a challenge page if the <title> is clearly
-    # a Cloudflare challenge. Note: Cloudflare injects a script reference to
-    # /cdn-cgi/challenge-platform/ on EVERY page it protects (including
-    # successful ones), so we cannot use that as a signal.
-    soup_head = BeautifulSoup(html, "html.parser")
-    title = (soup_head.title.string or "").strip() if soup_head.title else ""
-    print(f"page title: {title!r}")
+        if is_transient:
+            print(
+                f"all {max_attempts} attempts hit transient 502 errors. "
+                "Skipping this run; next scheduled check will try again."
+            )
+            return None
 
-    if "Just a moment" in title or "Attention Required" in title:
+        # A different non-200 error — raise loudly so the user sees it
         raise RuntimeError(
-            f"Cloudflare challenge page detected (title: {title!r}). "
-            "Scrape.do failed to clear it."
+            f"Scrape.do returned HTTP {resp.status_code}: {body}"
         )
 
-    return html
+    return None
 
 
 def extract_groningen_studios(html: str) -> list[dict]:
@@ -158,6 +195,12 @@ def send_email(subject: str, body: str) -> None:
 
 def main() -> int:
     html = render_booking_page()
+    if html is None:
+        # Scrape.do had a transient issue across all retries.
+        # Exit cleanly so the workflow stays green and the next scheduled run will try again.
+        print("done — no check performed this round.")
+        return 0
+
     studios = extract_groningen_studios(html)
     print(f"found {len(studios)} Groningen listing(s)")
 
