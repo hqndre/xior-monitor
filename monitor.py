@@ -40,6 +40,7 @@ def render_booking_page() -> str:
         "render": "true",       # full JavaScript rendering
         "super": "true",        # premium residential proxies (Cloudflare bypass)
         "geoCode": "nl",        # come from a Netherlands IP
+        "customWait": "5000",   # wait 5 extra seconds for late-loading content
     }
 
     print(f"requesting {BOOKING_URL} via Scrape.do ...")
@@ -54,12 +55,20 @@ def render_booking_page() -> str:
         )
 
     html = resp.text
+    print(f"got {len(html):,} bytes of HTML")
 
-    # Sanity check — if Cloudflare still showing, something is wrong on their end.
-    if "Just a moment" in html or "challenge-platform" in html:
+    # Sanity check — only flag as a challenge page if the <title> is clearly
+    # a Cloudflare challenge. Note: Cloudflare injects a script reference to
+    # /cdn-cgi/challenge-platform/ on EVERY page it protects (including
+    # successful ones), so we cannot use that as a signal.
+    soup_head = BeautifulSoup(html, "html.parser")
+    title = (soup_head.title.string or "").strip() if soup_head.title else ""
+    print(f"page title: {title!r}")
+
+    if "Just a moment" in title or "Attention Required" in title:
         raise RuntimeError(
-            "Cloudflare challenge still present in Scrape.do response. "
-            "Try increasing wait time or contact Scrape.do support."
+            f"Cloudflare challenge page detected (title: {title!r}). "
+            "Scrape.do failed to clear it."
         )
 
     return html
