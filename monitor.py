@@ -37,10 +37,7 @@ def render_booking_page() -> str:
     params = {
         "token": token,
         "url": BOOKING_URL,
-        "render": "true",       # full JavaScript rendering
-        "super": "true",        # premium residential proxies (Cloudflare bypass)
-        "geoCode": "nl",        # come from a Netherlands IP
-        "customWait": "5000",   # wait 5 extra seconds for late-loading content
+        "render": "true",       # JS rendering — Scrape.do handles anti-bot automatically with this alone
     }
 
     print(f"requesting {BOOKING_URL} via Scrape.do ...")
