@@ -2,14 +2,11 @@ name: Xior Groningen Monitor
 
 on:
   schedule:
-    # 3 check al giorno, Lun-Ven, alle 9:00 / 13:00 / 17:00 ora di Groningen (CEST = UTC+2)
-    # = 7:00 / 11:00 / 15:00 UTC. In inverno (CET = UTC+1) gli orari saranno 8:00/12:00/16:00 di Groningen.
-    # Totale: 3 × 5 giorni × ~4.3 settimane = ~65 chiamate/mese × 15 crediti = ~975 crediti (sotto i 1000).
-    - cron: "0 7,11,15 * * 1-5"
-  workflow_dispatch:        # also allows manual runs from the Actions tab
+    - cron: "*/5 * * * *"   # every 5 minutes (no API budget — only GitHub Actions minutes, free on public repos)
+  workflow_dispatch:
 
 permissions:
-  contents: write           # needed to commit state.json back
+  contents: write
 
 jobs:
   check:
@@ -30,10 +27,9 @@ jobs:
 
       - name: Run monitor
         env:
-          SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
-          SMTP_USER:       ${{ secrets.SMTP_USER }}
-          SMTP_PASS:       ${{ secrets.SMTP_PASS }}
-          TO_EMAIL:        ${{ secrets.TO_EMAIL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          TO_EMAIL:  ${{ secrets.TO_EMAIL }}
         run: python monitor.py
 
       - name: Commit updated state
