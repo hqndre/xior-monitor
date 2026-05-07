@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Xior Groningen studio availability monitor (Scrape.do edition).
+Xior Groningen studio availability monitor (v3 — xiorstudenthousing.eu edition).
 
-Fetches the booking site through Scrape.do's residential proxy +
-JS-rendering API, which bypasses Cloudflare. Designed to run hourly
-on GitHub Actions to stay within the 1000 free calls/month budget.
+Monitors the public Xior pages for the long-stay residences in Groningen.
+These pages are NOT Cloudflare-protected, so we can fetch them directly with
+plain HTTP requests — no Scrape.do, no JS rendering, no credit budget needed.
 
-State is kept in state.json (committed back by the workflow) so we
-only email on *changes*, not every run.
+Strategy:
+- For each property, fetch the page and extract:
+  * Specific room numbers shown (pattern "# X-XXX" like "# 2-075")
+  * A hash of the booking-relevant section (catches generic availability changes)
+- Compare with previous state. Email if anything new appears.
+
+State is kept in state.json (committed back by the workflow).
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import smtplib
 import sys
 import time
@@ -24,154 +30,70 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-# ----- config -----
-BOOKING_URL = "https://www.xior-booking.com/"
-CITY = "Groningen"
+# ----- properties to watch (all long-stay, Groningen) -----
+PROPERTIES = {
+    "Eendrachtskade": "https://www.xiorstudenthousing.eu/netherlands/groningen/eendrachtskade-student-accommodation/",
+    "Oosterhamrikkade": "https://www.xiorstudenthousing.eu/netherlands/groningen/oosterhamrikkade-student-accommodation/",
+    "Zernike Tower (long-stay)": "https://www.xiorstudenthousing.eu/netherlands/groningen/zernike-tower-student-accommodation/",
+}
+
 STATE_FILE = Path(__file__).parent / "state.json"
-SCRAPE_DO_API = "https://api.scrape.do/"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Pattern for specific room numbers (e.g. "# 2-075", "# 12-3", "#5-100")
+ROOM_NUMBER_RE = re.compile(r"#\s*\d{1,3}-\d{1,4}")
 
 
-def render_booking_page() -> str | None:
-    """Fetch the booking site via Scrape.do (Cloudflare bypass + JS render).
-
-    Returns the HTML on success, or None if Scrape.do had a transient
-    'cannot handle browser network' (HTTP 502) issue that didn't consume
-    credits. The caller should treat None as 'skip this run, try next time'
-    rather than failing loudly.
-    """
-    token = os.environ["SCRAPE_DO_TOKEN"]
-
-    params = {
-        "token": token,
-        "url": BOOKING_URL,
-        "render": "true",       # JS rendering — Scrape.do handles anti-bot automatically with this alone
-    }
-
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        print(f"requesting {BOOKING_URL} via Scrape.do (attempt {attempt}/{max_attempts}) ...")
+def fetch_url(url: str, retries: int = 2) -> str | None:
+    """Fetch a URL with retries. Returns HTML on success, None on failure."""
+    headers = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+    for attempt in range(1, retries + 2):
         try:
-            resp = requests.get(SCRAPE_DO_API, params=params, timeout=120)
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                return resp.text
+            print(f"  attempt {attempt}: HTTP {resp.status_code}")
         except requests.RequestException as e:
-            print(f"network error: {e}")
-            if attempt < max_attempts:
-                time.sleep(30)
-                continue
-            raise RuntimeError(
-                f"Scrape.do request failed after {max_attempts} attempts: {e}"
-            ) from e
-
-        # Success path
-        if resp.status_code == 200:
-            html = resp.text
-            print(f"got {len(html):,} bytes of HTML")
-
-            # Sanity check — only flag as challenge page if <title> is clearly Cloudflare
-            soup_head = BeautifulSoup(html, "html.parser")
-            title = (soup_head.title.string or "").strip() if soup_head.title else ""
-            print(f"page title: {title!r}")
-
-            if "Just a moment" in title or "Attention Required" in title:
-                raise RuntimeError(
-                    f"Cloudflare challenge page detected (title: {title!r}). "
-                    "Scrape.do failed to clear it."
-                )
-            return html
-
-        # Non-200 response
-        body = resp.text[:500]
-        print(f"Scrape.do returned HTTP {resp.status_code}: {body}")
-
-        # ErrorCode 90 = "cannot handle browser network" — transient, not charged
-        is_transient = (
-            resp.status_code == 502
-            and ('"ErrorCode":90' in body or "cannot handle browser network" in body)
-        )
-
-        if is_transient and attempt < max_attempts:
-            print(f"transient 502, waiting 30s before retry...")
-            time.sleep(30)
-            continue
-
-        if is_transient:
-            print(
-                f"all {max_attempts} attempts hit transient 502 errors. "
-                "Skipping this run; next scheduled check will try again."
-            )
-            return None
-
-        # A different non-200 error — raise loudly so the user sees it
-        raise RuntimeError(
-            f"Scrape.do returned HTTP {resp.status_code}: {body}"
-        )
-
+            print(f"  attempt {attempt}: network error: {e}")
+        if attempt <= retries:
+            time.sleep(10)
     return None
 
 
-def extract_groningen_studios(html: str) -> list[dict]:
-    """
-    Find studio listings for Groningen in the rendered HTML.
-    Returns a list of {sig, text, url} dicts.
-    """
+def extract_signature(html: str) -> dict:
+    """Extract availability signals from the HTML."""
     soup = BeautifulSoup(html, "html.parser")
-    found: dict[str, dict] = {}
+    # Use only the visible text — strip out scripts, styles, etc.
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(" ", strip=True).split())
 
-    # 1) anchors mentioning Groningen
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        text = " ".join(a.get_text(" ", strip=True).split())
-        haystack = (href + " " + text).lower()
-        if CITY.lower() in haystack:
-            sig = f"href:{href}"
-            card = a.find_parent(["article", "li", "div"])
-            desc = " ".join(card.get_text(" ", strip=True).split())[:300] if card else text
-            found[sig] = {
-                "sig": sig,
-                "text": desc or text or href,
-                "url": _normalize_url(href),
-            }
+    # 1) Specific room numbers (strongest signal)
+    rooms = sorted(set(ROOM_NUMBER_RE.findall(text)))
 
-    # 2) cards mentioning Groningen + a price (€) or size (m²)
-    for el in soup.find_all(["article", "li", "div"]):
-        text = " ".join(el.get_text(" ", strip=True).split())
-        if (
-            CITY.lower() in text.lower()
-            and ("€" in text or "m²" in text or " m2" in text.lower())
-            and len(text) < 600
-        ):
-            digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
-            sig = f"card:{digest}"
-            if sig not in found:
-                found[sig] = {"sig": sig, "text": text[:300], "url": BOOKING_URL}
+    # 2) Hash of the body text — catches any change to the page content.
+    # Strip volatile bits (times like "10:13") to reduce false positives.
+    cleaned = re.sub(r"\d{1,2}:\d{2}", "", text)
+    page_hash = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
 
-    return sorted(found.values(), key=lambda d: d["sig"])
+    return {"rooms": rooms, "hash": page_hash}
 
 
-def _normalize_url(href: str) -> str:
-    if href.startswith("http"):
-        return href
-    if href.startswith("/"):
-        return "https://www.xior-booking.com" + href
-    return BOOKING_URL
-
-
-def load_state() -> set[str]:
+def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return set(json.loads(STATE_FILE.read_text()).get("studios", []))
+            return json.loads(STATE_FILE.read_text())
         except Exception as e:
             print(f"warn: could not parse state.json ({e}); starting fresh")
-    return set()
+    return {}
 
 
-def save_state(studios: list[dict]) -> None:
-    STATE_FILE.write_text(
-        json.dumps(
-            {"studios": [s["sig"] for s in studios]},
-            indent=2,
-            sort_keys=True,
-        )
-    )
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
 def send_email(subject: str, body: str) -> None:
@@ -179,54 +101,80 @@ def send_email(subject: str, body: str) -> None:
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ["SMTP_USER"]
     smtp_pass = os.environ["SMTP_PASS"]
-    to_email = os.environ.get("TO_EMAIL", smtp_user)
+    to_emails_raw = os.environ.get("TO_EMAIL", smtp_user)
+    # Support multiple recipients separated by comma
+    to_emails = [e.strip() for e in to_emails_raw.split(",") if e.strip()]
 
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = smtp_user
-    msg["To"] = to_email
+    msg["To"] = ", ".join(to_emails)
 
     with smtplib.SMTP(smtp_host, smtp_port) as s:
         s.starttls()
         s.login(smtp_user, smtp_pass)
-        s.sendmail(smtp_user, [to_email], msg.as_string())
-    print(f"email sent to {to_email}: {subject}")
+        s.sendmail(smtp_user, to_emails, msg.as_string())
+    print(f"email sent to {to_emails}: {subject}")
 
 
 def main() -> int:
-    html = render_booking_page()
-    if html is None:
-        # Scrape.do had a transient issue across all retries.
-        # Exit cleanly so the workflow stays green and the next scheduled run will try again.
-        print("done — no check performed this round.")
-        return 0
+    state = load_state()
+    new_state: dict = {}
+    alerts: list[str] = []
 
-    studios = extract_groningen_studios(html)
-    print(f"found {len(studios)} Groningen listing(s)")
+    for name, url in PROPERTIES.items():
+        print(f"checking {name}...")
+        html = fetch_url(url)
+        if html is None:
+            print(f"  failed to fetch — keeping previous state")
+            if name in state:
+                new_state[name] = state[name]
+            continue
 
-    previous = load_state()
-    new_studios = [s for s in studios if s["sig"] not in previous]
+        sig = extract_signature(html)
+        new_state[name] = sig
+        print(f"  rooms={sig['rooms']} hash={sig['hash']}")
 
-    if new_studios:
-        lines = [
-            f"{len(new_studios)} new Groningen studio listing(s) on Xior:",
-            "",
-        ]
-        for s in new_studios:
-            lines.append(f"• {s['text']}")
-            lines.append(f"  -> {s['url']}")
-            lines.append("")
-        lines.append("Book fast — studios disappear in ~20 min once someone clicks.")
-        lines.append(f"Booking site: {BOOKING_URL}")
+        prev = state.get(name)
+        if prev is None:
+            print(f"  first run for this property — recording baseline, no alert")
+            continue
 
+        prev_rooms = set(prev.get("rooms", []))
+        new_rooms = [r for r in sig["rooms"] if r not in prev_rooms]
+        hash_changed = prev.get("hash") != sig["hash"]
+
+        if new_rooms:
+            alerts.append(
+                f"{name}: NEW SPECIFIC ROOMS available!\n"
+                f"   Rooms: {', '.join(new_rooms)}\n"
+                f"   Page: {url}\n"
+                f"   Book now: https://www.xior-booking.com/"
+            )
+        elif hash_changed:
+            alerts.append(
+                f"{name}: page content changed (could be new availability)\n"
+                f"   Check: {url}\n"
+                f"   Book: https://www.xior-booking.com/"
+            )
+
+    if alerts:
+        body = (
+            "Xior Groningen — possible new availability detected:\n\n"
+            + "\n\n".join(alerts)
+            + "\n\n---\n"
+            + "Studios disappear in ~20 min once someone clicks 'Let's book'.\n"
+            + "If the page hasn't visibly changed, it may be a minor content edit — "
+            + "still worth a quick look."
+        )
         send_email(
-            subject=f"[Xior] {len(new_studios)} new Groningen studio(s) available",
-            body="\n".join(lines),
+            subject=f"[Xior Groningen] {len(alerts)} property change(s) detected!",
+            body=body,
         )
     else:
-        print("no new studios — nothing to do")
+        print("no changes detected")
 
-    save_state(studios)
+    save_state(new_state)
     return 0
 
 
