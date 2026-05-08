@@ -117,7 +117,8 @@ def send_email(subject: str, body: str) -> None:
     print(f"email sent to {to_emails}: {subject}")
 
 
-def main() -> int:
+def check_once() -> None:
+    """Run one check cycle: fetch all properties, compare to previous state, email if changed."""
     state = load_state()
     new_state: dict = {}
     alerts: list[str] = []
@@ -172,10 +173,45 @@ def main() -> int:
             body=body,
         )
     else:
-        print("no changes detected")
+        print("no changes detected this iteration")
 
     save_state(new_state)
-    return 0
+
+
+def main() -> int:
+    """Run check_once() in a loop for ~55 minutes, checking every 5 minutes.
+
+    GitHub Actions throttles workflows scheduled every 5 minutes, so instead
+    we schedule the workflow hourly and do the 5-minute polling inside this
+    single long-running job.
+    """
+    CHECK_INTERVAL_S = 5 * 60          # 5 minutes between checks
+    MAX_RUN_S = 55 * 60                # leave 5 min buffer before GitHub's 60-min timeout
+
+    start = time.time()
+    iteration = 0
+
+    while True:
+        iteration += 1
+        elapsed = int(time.time() - start)
+        print(f"\n=== iteration {iteration} (elapsed: {elapsed}s) ===")
+
+        try:
+            check_once()
+        except Exception as e:
+            import traceback
+            print(f"iteration error: {e}")
+            traceback.print_exc()
+            # do NOT crash — try again next iteration
+
+        # Decide whether to sleep or exit
+        elapsed = time.time() - start
+        if elapsed + CHECK_INTERVAL_S >= MAX_RUN_S:
+            print(f"\ndone after {iteration} iterations ({int(elapsed)}s total)")
+            return 0
+
+        print(f"sleeping {CHECK_INTERVAL_S}s until next check...")
+        time.sleep(CHECK_INTERVAL_S)
 
 
 if __name__ == "__main__":
